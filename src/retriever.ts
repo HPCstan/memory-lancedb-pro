@@ -13,7 +13,12 @@ import {
 import { filterNoise } from "./noise-filter.js";
 import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
-import { toLifecycleMemory, getDecayableFromEntry } from "./smart-metadata.js";
+import {
+  getDecayableFromEntry,
+  isMemoryActiveAt,
+  parseSmartMetadata,
+  toLifecycleMemory,
+} from "./smart-metadata.js";
 
 // ============================================================================
 // Types & Configuration
@@ -302,6 +307,12 @@ export class MemoryRetriever {
     this.accessTracker = tracker;
   }
 
+  private filterActiveResults<T extends MemorySearchResult>(results: T[]): T[] {
+    return results.filter((result) =>
+      isMemoryActiveAt(parseSmartMetadata(result.entry.metadata, result.entry)),
+    );
+  }
+
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
@@ -349,8 +360,9 @@ export class MemoryRetriever {
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
+    const active = this.filterActiveResults(filtered);
 
-    const mapped = filtered.map(
+    const mapped = active.map(
       (result, index) =>
         ({
           ...result,
@@ -464,8 +476,9 @@ export class MemoryRetriever {
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
+    const active = this.filterActiveResults(filtered);
 
-    return filtered.map((result, index) => ({
+    return active.map((result, index) => ({
       ...result,
       rank: index + 1,
     }));
@@ -483,8 +496,9 @@ export class MemoryRetriever {
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
+    const active = this.filterActiveResults(filtered);
 
-    return filtered.map((result, index) => ({
+    return active.map((result, index) => ({
       ...result,
       rank: index + 1,
     }));

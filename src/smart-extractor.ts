@@ -23,11 +23,20 @@ import {
   ALWAYS_MERGE_CATEGORIES,
   MERGE_SUPPORTED_CATEGORIES,
   MEMORY_CATEGORIES,
+  TEMPORAL_VERSIONED_CATEGORIES,
   normalizeCategory,
 } from "./memory-categories.js";
 import { isNoise } from "./noise-filter.js";
 import type { NoisePrototypeBank } from "./noise-prototypes.js";
-import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats } from "./smart-metadata.js";
+import {
+  buildSmartMetadata,
+  deriveFactKey,
+  isMemoryActiveAt,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+  parseSupportInfo,
+  updateSupportStats,
+} from "./smart-metadata.js";
 
 // ============================================================================
 // Constants
@@ -36,7 +45,36 @@ import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, parseSu
 const SIMILARITY_THRESHOLD = 0.7;
 const MAX_SIMILAR_FOR_PROMPT = 3;
 const MAX_MEMORIES_PER_EXTRACTION = 5;
-const VALID_DECISIONS = new Set<string>(["create", "merge", "skip", "support", "contextualize", "contradict"]);
+const VALID_DECISIONS = new Set<string>([
+  "create",
+  "merge",
+  "skip",
+  "support",
+  "contextualize",
+  "contradict",
+  "supersede",
+]);
+
+function appendRelation(
+  existing: unknown,
+  relation: { type: string; targetId: string },
+): Array<{ type: string; targetId: string }> {
+  const rows = Array.isArray(existing)
+    ? existing.filter(
+      (item): item is { type: string; targetId: string } =>
+        !!item &&
+        typeof item === "object" &&
+        typeof (item as { type?: unknown }).type === "string" &&
+        typeof (item as { targetId?: unknown }).targetId === "string",
+    )
+    : [];
+
+  if (rows.some((item) => item.type === relation.type && item.targetId === relation.targetId)) {
+    return rows;
+  }
+
+  return [...rows, relation];
+}
 
 // ============================================================================
 // Smart Extractor
@@ -358,6 +396,27 @@ export class SmartExtractor {
         stats.skipped++;
         break;
 
+      case "supersede":
+        if (
+          dedupResult.matchId &&
+          TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category)
+        ) {
+          await this.handleSupersede(
+            candidate,
+            vector,
+            dedupResult.matchId,
+            sessionKey,
+            targetScope,
+            scopeFilter,
+          );
+          stats.created++;
+          stats.superseded = (stats.superseded ?? 0) + 1;
+        } else {
+          await this.storeCandidate(candidate, vector, sessionKey, targetScope);
+          stats.created++;
+        }
+        break;
+
       case "support":
         if (dedupResult.matchId) {
           await this.handleSupport(dedupResult.matchId, scopeFilter, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel);
@@ -380,8 +439,24 @@ export class SmartExtractor {
 
       case "contradict":
         if (dedupResult.matchId) {
-          await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel);
-          stats.created++;
+          if (
+            TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category) &&
+            (!dedupResult.contextLabel || dedupResult.contextLabel === "general")
+          ) {
+            await this.handleSupersede(
+              candidate,
+              vector,
+              dedupResult.matchId,
+              sessionKey,
+              targetScope,
+              scopeFilter,
+            );
+            stats.created++;
+            stats.superseded = (stats.superseded ?? 0) + 1;
+          } else {
+            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel);
+            stats.created++;
+          }
         } else {
           await this.storeCandidate(candidate, vector, sessionKey, targetScope);
           stats.created++;
@@ -409,13 +484,16 @@ export class SmartExtractor {
       SIMILARITY_THRESHOLD,
       scopeFilter,
     );
+    const activeSimilar = similar.filter((result) =>
+      isMemoryActiveAt(parseSmartMetadata(result.entry.metadata, result.entry)),
+    );
 
-    if (similar.length === 0) {
+    if (activeSimilar.length === 0) {
       return { decision: "create", reason: "No similar memories found" };
     }
 
     // Stage 2: LLM decision
-    return this.llmDedupDecision(candidate, similar);
+    return this.llmDedupDecision(candidate, activeSimilar);
   }
 
   private async llmDedupDecision(
@@ -476,7 +554,7 @@ export class SmartExtractor {
       return {
         decision,
         reason: data.reason ?? "",
-        matchId: ["merge", "support", "contextualize", "contradict"].includes(decision) ? matchEntry?.entry.id : undefined,
+        matchId: ["merge", "support", "contextualize", "contradict", "supersede"].includes(decision) ? matchEntry?.entry.id : undefined,
         contextLabel: typeof (data as any).context_label === "string" ? (data as any).context_label : undefined,
       };
     } catch (err) {
@@ -637,6 +715,83 @@ export class SmartExtractor {
 
     this.log(
       `memory-pro: smart-extractor: merged [${candidate.category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`,
+    );
+  }
+
+  /**
+   * Handle SUPERSEDE: preserve the old record as historical but mark it as no
+   * longer current, then create the new active fact.
+   */
+  private async handleSupersede(
+    candidate: CandidateMemory,
+    vector: number[],
+    matchId: string,
+    sessionKey: string,
+    targetScope: string,
+    scopeFilter: string[],
+  ): Promise<void> {
+    const existing = await this.store.getById(matchId, scopeFilter);
+    if (!existing) {
+      await this.storeCandidate(candidate, vector, sessionKey, targetScope);
+      return;
+    }
+
+    const now = Date.now();
+    const existingMeta = parseSmartMetadata(existing.metadata, existing);
+    const factKey =
+      existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
+    const storeCategory = this.mapToStoreCategory(candidate.category);
+    const created = await this.store.store({
+      text: candidate.abstract,
+      vector,
+      category: storeCategory,
+      scope: targetScope,
+      importance: this.getDefaultImportance(candidate.category),
+      metadata: stringifySmartMetadata(
+        buildSmartMetadata(
+          {
+            text: candidate.abstract,
+            category: storeCategory,
+          },
+          {
+            l0_abstract: candidate.abstract,
+            l1_overview: candidate.overview,
+            l2_content: candidate.content,
+            memory_category: candidate.category,
+            tier: "working",
+            access_count: 0,
+            confidence: 0.7,
+            source_session: sessionKey,
+            valid_from: now,
+            fact_key: factKey,
+            supersedes: matchId,
+            relations: appendRelation([], {
+              type: "supersedes",
+              targetId: matchId,
+            }),
+          },
+        ),
+      ),
+    });
+
+    const invalidatedMetadata = buildSmartMetadata(existing, {
+      fact_key: factKey,
+      invalidated_at: now,
+      superseded_by: created.id,
+      relations: appendRelation(existingMeta.relations, {
+        type: "superseded_by",
+        targetId: created.id,
+      }),
+    });
+
+    await this.store.update(
+      matchId,
+      { metadata: stringifySmartMetadata(invalidatedMetadata) },
+      scopeFilter,
+    );
+
+    this.log(
+      `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
     );
   }
 
